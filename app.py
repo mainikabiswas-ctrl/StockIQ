@@ -44,6 +44,102 @@ stocks = {
 }
 
 # =====================================================
+# 1A. LOAD NSE EQUITY STOCKS
+# =====================================================
+
+def load_nse_stocks():
+
+    try:
+        df = pd.read_csv(
+            "NSE_CM_security_20112026.csv.gz",
+            dtype=str,
+            encoding="utf-8-sig"
+        )
+
+        required_columns = [
+            "TckrSymb",
+            "SctySrs",
+            "FinInstrmNm",
+            "ISIN",
+            "DelFlg"
+        ]
+
+        missing = [
+            col for col in required_columns
+            if col not in df.columns
+        ]
+
+        if missing:
+            raise ValueError(
+                f"Missing columns in NSE file: {missing}"
+            )
+
+        # Keep ordinary equity and trade-to-trade equity
+        df["SctySrs"] = df["SctySrs"].str.strip().str.upper()
+
+        df = df[
+            df["SctySrs"].isin(["EQ", "BE"])
+        ].copy()
+
+        # Exclude deleted securities
+        df = df[
+            df["DelFlg"].str.strip().str.upper() != "Y"
+        ]
+
+        # Exclude test and invalid records
+        df = df[
+            df["TckrSymb"].str.strip().ne("")
+            & ~df["TckrSymb"].str.contains(
+                "TEST", case=False, na=False
+            )
+            & df["ISIN"].str.match(
+                r"^INE[A-Z0-9]{9}$", na=False
+            )
+        ]
+
+        # Prefer EQ when a symbol has multiple series
+        df["SeriesPriority"] = df["SctySrs"].map(
+            {"EQ": 0, "BE": 1}
+        )
+
+        df = df.sort_values("SeriesPriority")
+        df = df.drop_duplicates(
+            subset=["TckrSymb"],
+            keep="first"
+        )
+
+        nse_stocks = {}
+
+        for _, row in df.iterrows():
+
+            company = row["FinInstrmNm"].strip()
+            symbol = row["TckrSymb"].strip()
+
+            if not company or not symbol:
+                continue
+
+            nse_stocks[company] = {
+                "symbol": f"{symbol}.NS",
+                "news_query": f'"{company}"'
+            }
+
+        return nse_stocks
+
+    except Exception as e:
+        st.warning(
+            f"Could not load NSE stock list: {e}"
+        )
+        return {}
+
+
+# Merge NSE stocks with the original five stocks
+nse_stocks = load_nse_stocks()
+
+stocks.update(nse_stocks)
+
+
+
+# =====================================================
 # 2. API KEY CONFIGURATION
 # =====================================================
 
@@ -436,6 +532,7 @@ st.write(
 st.divider()
 
 
+
 # =====================================================
 # 7. STOCK SELECTION
 # =====================================================
@@ -445,8 +542,9 @@ col1, col2 = st.columns(2)
 with col1:
 
     selected_stock = st.selectbox(
-        "Select Company",
-        list(stocks.keys())
+        "Search / Select Company",
+        options=sorted(stocks.keys()),
+        index=0
     )
 
 with col2:
