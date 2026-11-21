@@ -6,6 +6,7 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 import json
+from sklearn.ensemble import RandomForestRegressor
 
 # =====================================================
 # 1. APPLICATION CONFIGURATION
@@ -141,6 +142,164 @@ def fetch_stock_data(symbol, period):
     )
 
     return data
+
+
+# =====================================================
+# 4. MACHINE LEARNING PRICE FORECASTING
+# =====================================================
+
+def forecast_stock_prices(close_prices, forecast_days=20):
+
+    prices = pd.Series(close_prices).dropna().astype(float).tolist()
+
+    if len(prices) < 60:
+        raise ValueError(
+            "At least 60 trading days of data are required."
+        )
+
+    def create_features(values):
+
+        return [
+            values[-1],
+            values[-2],
+            values[-3],
+            values[-5],
+            values[-10],
+            values[-20],
+            np.mean(values[-5:]),
+            np.mean(values[-10:]),
+            np.mean(values[-20:]),
+            np.std(values[-5:]),
+            np.std(values[-20:])
+        ]
+
+    X = []
+    y = []
+
+    for i in range(20, len(prices) - 1):
+
+        X.append(create_features(prices[:i + 1]))
+        y.append(prices[i + 1])
+
+    X = np.array(X)
+    y = np.array(y)
+
+    # Chronological train-test split
+    split = int(len(X) * 0.80)
+
+    if split < 20 or len(X) - split < 2:
+        raise ValueError("Insufficient data for model evaluation.")
+
+    X_train = X[:split]
+    X_test = X[split:]
+
+    y_train = y[:split]
+    y_test = y[split:]
+
+    # Random Forest model
+    model = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=6,
+        min_samples_leaf=3,
+        random_state=42,
+        n_jobs=-1
+    )
+
+    model.fit(X_train, y_train)
+
+    # Model performance
+    predictions = model.predict(X_test)
+
+    mae = np.mean(np.abs(y_test - predictions))
+
+    baseline_mae = np.mean(
+        np.abs(y_test - X_test[:, 0])
+    )
+
+    # Retrain using all available observations
+    model.fit(X, y)
+
+    # Iterative future price prediction
+    history = prices.copy()
+    future_prices = []
+
+    for _ in range(forecast_days):
+
+        features = np.array(
+            create_features(history)
+        ).reshape(1, -1)
+
+        next_price = float(model.predict(features)[0])
+
+        next_price = max(next_price, 0)
+
+        future_prices.append(next_price)
+
+        history.append(next_price)
+
+    return {
+        "future_prices": future_prices,
+        "mae": float(mae),
+        "baseline_mae": float(baseline_mae)
+    }
+
+def forecast_four_year_scenarios(symbol, current_price, simulations=10000):
+    """Bootstrap historical monthly returns into 1-4 year scenario ranges.
+
+    These are illustrative scenarios based on historical monthly returns,
+    not reliable point forecasts or investment recommendations.
+    """
+    monthly = yf.Ticker(symbol).history(
+        period="10y",
+        interval="1mo",
+        auto_adjust=True
+    )
+
+    if monthly.empty or "Close" not in monthly.columns:
+        raise ValueError("Unable to retrieve monthly history for the 4-year projection.")
+
+    closes = monthly["Close"].dropna().astype(float)
+    monthly_returns = closes.pct_change().dropna()
+    monthly_returns = monthly_returns.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(monthly_returns) < 36:
+        raise ValueError(
+            "At least 3 years of monthly history are needed for this scenario analysis."
+        )
+
+    # Bootstrap observed monthly returns to create many possible paths.
+    rng = np.random.default_rng(42)
+    sampled_returns = rng.choice(
+        monthly_returns.to_numpy(),
+        size=(simulations, 48),
+        replace=True
+    )
+
+    # Avoid invalid negative prices if a source contains a bad return observation.
+    sampled_returns = np.maximum(sampled_returns, -0.99)
+    paths = float(current_price) * np.cumprod(1.0 + sampled_returns, axis=1)
+
+    rows = []
+    percentiles = {}
+    for year in range(1, 5):
+        values = paths[:, year * 12 - 1]
+        p10, p50, p90 = np.percentile(values, [10, 50, 90])
+        percentiles[year] = {"low": float(p10), "base": float(p50), "high": float(p90)}
+        rows.append({
+            "Horizon": f"Year {year}",
+            "Pessimistic (10th percentile)": round(float(p10), 2),
+            "Base case (median)": round(float(p50), 2),
+            "Optimistic (90th percentile)": round(float(p90), 2)
+        })
+
+    historical_cagr = (closes.iloc[-1] / closes.iloc[0]) ** (12 / max(len(closes) - 1, 1)) - 1
+
+    return {
+        "table": pd.DataFrame(rows),
+        "percentiles": percentiles,
+        "historical_months": int(len(monthly_returns)),
+        "historical_cagr": float(historical_cagr)
+    }
 
 
 # =====================================================
@@ -485,6 +644,190 @@ if st.session_state.get("stock_analysis_requested", False):
             data.tail(10),
             use_container_width=True
         )
+
+        
+        # ==========================================
+        # 15. FUTURE STOCK PRICE PREDICTION
+        # ==========================================
+
+        st.divider()
+
+        st.header("🔮 Future Stock Price Prediction")
+
+        st.write(
+            "Explore estimated future stock prices "
+            "using machine learning."
+        )
+
+        if st.button("Generate Future Price Forecast"):
+
+            try:
+                with st.spinner("Generating forecast..."):
+
+                    forecast = forecast_stock_prices(
+                        data["Close"].dropna().values
+                    )
+
+                    st.session_state["stock_forecast"] = {
+                        "symbol": symbol,
+                        "period": period,
+                        "result": forecast
+                    }
+
+            except Exception as e:
+                st.error(f"Forecasting error: {e}")
+
+        saved_forecast = st.session_state.get("stock_forecast")
+
+        if (
+            saved_forecast
+            and saved_forecast["symbol"] == symbol
+            and saved_forecast["period"] == period
+        ):
+
+            result = saved_forecast["result"]
+
+            current_price = float(data["Close"].iloc[-1])
+
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric(
+                "5-Day Forecast",
+                f"₹{result['future_prices'][4]:,.2f}"
+            )
+
+            col2.metric(
+                "10-Day Forecast",
+                f"₹{result['future_prices'][9]:,.2f}"
+            )
+
+            col3.metric(
+                "20-Day Forecast",
+                f"₹{result['future_prices'][19]:,.2f}"
+            )
+
+            st.subheader("Model Performance")
+
+            c1, c2 = st.columns(2)
+
+            c1.metric("Random Forest MAE", f"₹{result['mae']:,.2f}")
+
+            c2.metric(
+                "Baseline MAE",
+                f"₹{result['baseline_mae']:,.2f}"
+            )
+
+            st.subheader("Future Price Projection")
+
+            future_dates = pd.bdate_range(
+                start=pd.Timestamp(data.index[-1]).normalize()
+                     + pd.offsets.BDay(1),
+                periods=20
+            )
+
+            fig = go.Figure()
+
+            fig.add_trace(go.Scatter(
+                x=data.index[-30:],
+                y=data["Close"].tail(30),
+                name="Historical Price"
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=future_dates,
+                y=result["future_prices"],
+                name="Predicted Price",
+                mode="lines+markers",
+                line=dict(dash="dash")
+            ))
+
+            fig.update_layout(
+                height=450,
+                template="plotly_white",
+                xaxis_title="Date",
+                yaxis_title="Price (INR)"
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.caption(
+                "Predictions are experimental estimates, "
+                "not guaranteed future prices or investment advice."
+            )
+
+        # =================================================
+        # 15. FOUR-YEAR PRICE SCENARIO ANALYSIS
+        # =================================================
+
+        st.divider()
+        st.header("📅 Four-Year Stock Price Outlook")
+        st.write(
+            "Explore a range of possible prices over the next four years, "
+            "based on resampling the stock's historical monthly returns."
+        )
+        st.caption(
+            "This is a historical-return scenario simulation, not a machine-learning "
+            "certainty or a guaranteed price target. Actual prices may fall outside these ranges."
+        )
+
+        if st.button("Generate 4-Year Price Scenarios"):
+            try:
+                with st.spinner("Simulating 4-year scenarios using up to 10 years of monthly history..."):
+                    long_term_result = forecast_four_year_scenarios(
+                        symbol,
+                        float(data["Close"].dropna().iloc[-1])
+                    )
+                    st.session_state["four_year_forecast"] = {
+                        "symbol": symbol,
+                        "result": long_term_result
+                    }
+            except Exception as e:
+                st.error(f"4-year scenario analysis failed: {e}")
+
+        saved_long_term = st.session_state.get("four_year_forecast")
+        if saved_long_term and saved_long_term.get("symbol") == symbol:
+            long_result = saved_long_term["result"]
+            st.subheader("Estimated Price Ranges")
+            st.dataframe(long_result["table"], use_container_width=True, hide_index=True)
+
+            st.metric(
+                "Historical annualised growth over retrieved monthly history",
+                f"{long_result['historical_cagr'] * 100:.2f}%"
+            )
+            st.caption(
+                f"Simulation resampled {long_result['historical_months']} historical monthly returns "
+                "across 10,000 possible paths. The 10th, 50th and 90th percentiles are scenario ranges, "
+                "not confidence guarantees. Past performance does not predict future results."
+            )
+
+            projection_years = [0, 1, 2, 3, 4]
+            current_for_chart = float(data["Close"].dropna().iloc[-1])
+            low_line = [current_for_chart] + [long_result["percentiles"][y]["low"] for y in range(1, 5)]
+            base_line = [current_for_chart] + [long_result["percentiles"][y]["base"] for y in range(1, 5)]
+            high_line = [current_for_chart] + [long_result["percentiles"][y]["high"] for y in range(1, 5)]
+            labels = ["Today", "1 year", "2 years", "3 years", "4 years"]
+
+            scenario_fig = go.Figure()
+            scenario_fig.add_trace(go.Scatter(
+                x=labels, y=high_line, name="Optimistic (90th percentile)",
+                mode="lines+markers", line=dict(dash="dot")
+            ))
+            scenario_fig.add_trace(go.Scatter(
+                x=labels, y=low_line, name="Pessimistic (10th percentile)",
+                mode="lines+markers", fill="tonexty", line=dict(dash="dot")
+            ))
+            scenario_fig.add_trace(go.Scatter(
+                x=labels, y=base_line, name="Base case (median)",
+                mode="lines+markers", line=dict(width=3)
+            ))
+            scenario_fig.update_layout(
+                height=480,
+                template="plotly_white",
+                xaxis_title="Forecast horizon",
+                yaxis_title="Illustrative price (INR)",
+                hovermode="x unified"
+            )
+            st.plotly_chart(scenario_fig, use_container_width=True)
 
         # =================================================
         # 14. FINANCIAL NEWS INTELLIGENCE
