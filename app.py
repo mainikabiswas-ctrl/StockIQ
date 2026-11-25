@@ -18,7 +18,7 @@ st.set_page_config(
     layout="wide"
 )
 
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 stocks = {
     "Reliance Industries": {
